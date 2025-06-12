@@ -93,5 +93,4 @@ Eliraft.Acceptor.read(acceptor, {:get, "key"})
   ```
 
 ## License
-
-[Your License Here]
+ GPL-3.0 license
