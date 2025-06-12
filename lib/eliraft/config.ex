@@ -57,6 +57,15 @@ defmodule Eliraft.Config do
   end
 
   @doc """
+  Adds a member to the configuration.
+  """
+  def add_member(config, member) do
+    new_members = Map.put(config.members, member, true)
+    new_full_members = [member | config.full_members]
+    %{config | members: new_members, full_members: new_full_members, version: config.version + 1}
+  end
+
+  @doc """
   Returns true if the given node is a data replica.
   """
   def is_data_replica?(%__MODULE__{full_members: full_members}, node) do

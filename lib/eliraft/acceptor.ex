@@ -7,7 +7,7 @@ defmodule Eliraft.Acceptor do
   use GenServer
   require Logger
 
-  alias Eliraft.{Queue, Config}
+  alias Eliraft.{Queue, Config, Server}
 
   # Types
   @type command :: term()
@@ -30,6 +30,7 @@ defmodule Eliraft.Acceptor do
     | {:apply_queue_full, key()}
     | {:notify_redirect, node()}
     | :commit_stalled
+    | :invalid_command
   @type commit_error :: {:error, commit_error_type()}
   @type commit_result :: term() | commit_error() | call_error()
 
@@ -101,9 +102,17 @@ defmodule Eliraft.Acceptor do
   end
 
   @impl true
-  def handle_call({:commit, _op}, _from, state) do
-    # TODO: Implement commit logic
-    {:reply, :ok, state}
+  def handle_call({:commit, op}, _from, state) do
+    # Check if the command is valid
+    if not is_valid_command?(op) do
+      {:reply, {:error, :invalid_command}, state}
+    else
+      # Forward the commit to the server
+      case GenServer.call(state.server, {:append, %{term: 1, command: op}}) do
+        :ok -> {:reply, :ok, state}
+        error -> {:reply, error, state}
+      end
+    end
   end
 
   @impl true
@@ -119,6 +128,14 @@ defmodule Eliraft.Acceptor do
   end
 
   # Private Functions
+
+  defp is_valid_command?(op) do
+    case op do
+      {:set, _key, _value} -> true
+      {:delete, _key} -> true
+      _ -> false
+    end
+  end
 
   defp make_call(_server, _request, _timeout) do
     # TODO: Implement call logic

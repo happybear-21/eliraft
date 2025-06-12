@@ -65,12 +65,15 @@ defmodule Eliraft.RaftTest do
 
   describe "Acceptor" do
     setup do
-      {:ok, server} = Server.start_link(table: :eliraft_table, partition: 3, application: Eliraft)
-      {:ok, acceptor} = Acceptor.start_link(name: :test_acceptor, server: server)
-      %{acceptor: acceptor}
+      unique = System.unique_integer([:positive])
+      {:ok, log} = Log.start_link(name: String.to_atom("acceptor_log_" <> Integer.to_string(unique)))
+      {:ok, server} = Server.start_link(table: :eliraft_table, partition: 3, application: Eliraft, log: log, name: String.to_atom("acceptor_server_" <> Integer.to_string(unique)))
+      {:ok, acceptor} = Acceptor.start_link(name: String.to_atom("test_acceptor_" <> Integer.to_string(unique)), server: server)
+      %{acceptor: acceptor, server: server}
     end
 
-    test "commit returns :ok", %{acceptor: acceptor} do
+    test "commit returns :ok", %{acceptor: acceptor, server: server} do
+      Server.set_state(server, :leader)
       assert Acceptor.commit(acceptor, {:set, "key", "value"}) == :ok
     end
 
