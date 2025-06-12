@@ -114,7 +114,7 @@ defmodule Eliraft.Log do
   @impl true
   def handle_call({:append, entry}, _from, state) do
     if entry.term >= state.current_term do
-      new_entries = state.entries ++ [entry]
+      new_entries = state.entries ++ [Map.put(entry, :index, length(state.entries))]
       new_state = %{state | entries: new_entries, current_term: entry.term}
       persist_state(new_state)
       {:reply, :ok, new_state}
@@ -128,7 +128,9 @@ defmodule Eliraft.Log do
     if Enum.any?(entries, &(&1.term < state.current_term)) do
       {:reply, {:error, :stale_term}, state}
     else
-      new_entries = state.entries ++ entries
+      new_entries = state.entries ++ Enum.map(entries, fn entry ->
+        Map.put(entry, :index, length(state.entries) + Enum.find_index(entries, &(&1 == entry)))
+      end)
       new_term = Enum.max([state.current_term | Enum.map(entries, & &1.term)])
       new_state = %{state | entries: new_entries, current_term: new_term}
       persist_state(new_state)

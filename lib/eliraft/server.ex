@@ -15,7 +15,7 @@ defmodule Eliraft.Server do
   defstruct [
     :name,
     :log,
-    :state,
+    :role,
     :current_term,
     :voted_for,
     :commit_index,
@@ -26,7 +26,6 @@ defmodule Eliraft.Server do
     :leader,
     :election_timer,
     :heartbeat_timer,
-    :role,
     :storage
   ]
 
@@ -56,7 +55,8 @@ defmodule Eliraft.Server do
   @impl true
   def init(opts) do
     state = %{
-      state: :follower,
+      name: Keyword.get(opts, :name, __MODULE__),
+      role: :follower,
       current_term: 0,
       voted_for: nil,
       log: Keyword.get(opts, :log),
@@ -68,8 +68,7 @@ defmodule Eliraft.Server do
       membership: %{},
       election_timer: nil,
       heartbeat_timer: nil,
-      leader: nil,
-      role: :follower
+      leader: nil
     }
     state = schedule_election_timeout(state)
     {:ok, state}
@@ -101,12 +100,14 @@ defmodule Eliraft.Server do
 
   @impl true
   def handle_info(:election_timeout, state) do
-    if state.state == :follower do
+    if state.role == :follower do
       new_state = %{state |
-        state: :candidate,
+        role: :candidate,
         current_term: state.current_term + 1,
-        voted_for: self()
+        voted_for: self(),
+        leader: nil
       }
+      new_state = schedule_election_timeout(new_state)
       {:noreply, new_state}
     else
       {:noreply, state}
@@ -115,7 +116,7 @@ defmodule Eliraft.Server do
 
   @impl true
   def handle_call(:get_state, _from, state) do
-    {:reply, state.state, state}
+    {:reply, state.role, state}
   end
 
   @impl true
@@ -134,7 +135,7 @@ defmodule Eliraft.Server do
   end
 
   def handle_call({:append, %{term: term, command: command}}, _from, state) do
-    if state.state == :leader do
+    if state.role == :leader do
       case Log.append(state.log, %{term: term, command: command}) do
         :ok ->
           new_state = %{state | commit_index: state.commit_index + 1}
@@ -150,7 +151,7 @@ defmodule Eliraft.Server do
   end
 
   def handle_call({:read, key}, _from, state) do
-    if state.state == :leader do
+    if state.role == :leader do
       case Log.get_entries(state.log, 0, state.commit_index) do
         {:ok, entries} ->
           value = find_value_in_entries(entries, key)
@@ -180,8 +181,13 @@ defmodule Eliraft.Server do
         {:reply, {:error, :stale_term}, state}
 
       term > state.current_term ->
-        new_state = %{state | current_term: term, voted_for: nil, state: :follower}
-        schedule_election_timeout(new_state)
+        new_state = %{state | 
+          current_term: term, 
+          voted_for: nil, 
+          role: :follower,
+          leader: nil
+        }
+        new_state = schedule_election_timeout(new_state)
         {:reply, {:error, :stale_term}, new_state}
 
       state.voted_for != nil and state.voted_for != candidate_id ->
@@ -191,8 +197,12 @@ defmodule Eliraft.Server do
         case Log.get_entries(state.log, 0, last_log_index) do
           {:ok, entries} ->
             if is_log_consistent?(entries, last_log_term) do
-              new_state = %{state | voted_for: candidate_id}
-              schedule_election_timeout(new_state)
+              new_state = %{state | 
+                voted_for: candidate_id,
+                role: :follower,
+                leader: candidate_id
+              }
+              new_state = schedule_election_timeout(new_state)
               {:reply, :ok, new_state}
             else
               {:reply, {:error, :inconsistent_log}, state}
@@ -216,9 +226,10 @@ defmodule Eliraft.Server do
             new_state = %{state | 
               commit_index: new_commit_index,
               current_term: term,
-              state: :follower
+              role: :follower,
+              leader: self()
             }
-            schedule_election_timeout(new_state)
+            new_state = schedule_election_timeout(new_state)
             {:reply, :ok, new_state}
 
           error ->
@@ -243,8 +254,8 @@ defmodule Eliraft.Server do
     end
   end
 
-  def handle_call({:set_state, new_state}, _from, state) do
-    {:reply, :ok, %{state | state: new_state}}
+  def handle_call({:set_state, new_role}, _from, state) do
+    {:reply, :ok, %{state | role: new_role}}
   end
 
   def handle_call({:set_term, new_term}, _from, state) do
@@ -258,7 +269,7 @@ defmodule Eliraft.Server do
   def handle_call({:vote_granted, term}, _from, state) do
     new_state =
       if term >= state.current_term do
-        %{state | state: :leader, current_term: term}
+        %{state | role: :leader, current_term: term}
       else
         state
       end
@@ -289,7 +300,7 @@ defmodule Eliraft.Server do
         new_state = %{state |
           current_term: term,
           voted_for: candidate,
-          state: :follower
+          role: :follower
         }
         {:reply, :ok, new_state}
     end
@@ -300,7 +311,7 @@ defmodule Eliraft.Server do
   end
 
   def handle_call(:become_leader, _from, state) do
-    {:reply, :ok, %{state | state: :leader}}
+    {:reply, :ok, %{state | role: :leader}}
   end
 
   def status(server) do
@@ -310,7 +321,7 @@ defmodule Eliraft.Server do
   @impl true
   def handle_call(:status, _from, state) do
     {:reply, %{
-      state: state.state,
+      state: state.role,
       term: state.current_term,
       leader: state.voted_for,
       membership: state.membership
@@ -327,7 +338,7 @@ defmodule Eliraft.Server do
       true ->
         new_state = %{state |
           current_term: term,
-          state: :follower,
+          role: :follower,
           commit_index: min(leader_commit, state.commit_index + length(entries))
         }
         {:reply, :ok, new_state}
@@ -344,7 +355,7 @@ defmodule Eliraft.Server do
 
     new_state = %{
       state
-      | state: :candidate,
+      | role: :candidate,
         current_term: new_term,
         voted_for: state.name,
         election_timer: nil
@@ -355,6 +366,10 @@ defmodule Eliraft.Server do
   end
 
   defp schedule_election_timeout(state) do
+    if state.election_timer != nil do
+      Process.cancel_timer(state.election_timer)
+    end
+
     timeout = :rand.uniform(@election_timeout_max - @election_timeout_min) + @election_timeout_min
     timer = Process.send_after(self(), :election_timeout, timeout)
     %{state | election_timer: timer}
@@ -380,15 +395,17 @@ defmodule Eliraft.Server do
   defp is_log_consistent?(entries, last_log_term) do
     case List.last(entries) do
       nil -> true
-      entry -> entry.term == last_log_term
+      last_entry -> last_entry.term == last_log_term
     end
   end
 
   defp find_value_in_entries(entries, key) do
-    Enum.reduce(entries, nil, fn entry, acc ->
+    entries
+    |> Enum.reverse()
+    |> Enum.find_value(fn entry ->
       case entry.command do
         {:set, ^key, value} -> value
-        _ -> acc
+        _ -> nil
       end
     end)
   end
