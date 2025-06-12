@@ -1,24 +1,21 @@
 defmodule Eliraft.Server do
   @moduledoc """
-  Implements the Raft server process.
+  The Raft server implementation.
   """
 
   use GenServer
   require Logger
 
-  alias Eliraft.{Identity, Config, Log}
+  alias Eliraft.{Identity, Config, Log, Storage, Storage.Disk, Server}
 
-  # Constants
-  @heartbeat_interval 50
-  @commit_batch_interval 10
   @election_timeout_min 150
   @election_timeout_max 300
+  @heartbeat_interval 50
 
-  # Server state
   defstruct [
     :name,
     :log,
-    :state,  # :follower, :candidate, or :leader
+    :state,
     :current_term,
     :voted_for,
     :commit_index,
@@ -28,199 +25,88 @@ defmodule Eliraft.Server do
     :membership,
     :leader,
     :election_timer,
-    :heartbeat_timer
+    :heartbeat_timer,
+    :role,
+    :storage
   ]
 
-  # Public API
-
-  @doc """
-  Starts a new Raft server.
-  """
-  def start_link(opts \\ []) do
-    GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name))
+  defmodule AppendEntriesRequest do
+    defstruct [
+      :term,
+      :leader_id,
+      :prev_log_index,
+      :prev_log_term,
+      :entries,
+      :leader_commit
+    ]
   end
 
-  @doc """
-  Gets the current status of the server.
-  """
-  def status(server) do
-    GenServer.call(server, :status)
+  defmodule AppendEntriesResponse do
+    defstruct [
+      :term,
+      :success
+    ]
   end
 
-  @doc """
-  Gets the membership of the server.
-  """
-  def membership(server) do
-    GenServer.call(server, :membership)
+  def start_link(opts) do
+    name = Keyword.get(opts, :name, __MODULE__)
+    GenServer.start_link(__MODULE__, opts, name: name)
   end
-
-  @doc """
-  Gets the log entries from the server.
-  """
-  def get_entries(server) do
-    GenServer.call(server, :get_entries)
-  end
-
-  @doc """
-  Sets the server state (for testing).
-  """
-  def set_state(server, new_state) do
-    GenServer.call(server, {:set_state, new_state})
-  end
-
-  @doc """
-  Sets the server term (for testing).
-  """
-  def set_term(server, term) do
-    GenServer.call(server, {:set_term, term})
-  end
-
-  @doc """
-  Adds a member to the server's membership (for testing).
-  """
-  def add_member(server, member) do
-    GenServer.call(server, {:add_member, member})
-  end
-
-  @doc """
-  Handles a vote request from another server (for testing).
-  """
-  def handle_vote_request(server, candidate, term) do
-    GenServer.call(server, {:handle_vote_request, candidate, term})
-  end
-
-  @doc """
-  Replicates log entries to a follower (for testing).
-  """
-  def replicate_log(leader, follower) do
-    GenServer.call(leader, {:replicate_log, follower})
-  end
-
-  # Server Callbacks
 
   @impl true
   def init(opts) do
-    Logger.notice("Server[#{opts[:name]}] starting")
-    Process.flag(:trap_exit, true)
-
-    state = %__MODULE__{
-      name: opts[:name],
-      log: opts[:log],
+    state = %{
       state: :follower,
       current_term: 0,
       voted_for: nil,
+      log: Keyword.get(opts, :log),
+      storage: Keyword.get(opts, :storage),
       commit_index: 0,
       last_applied: 0,
       next_index: %{},
       match_index: %{},
       membership: %{},
-      leader: nil
+      election_timer: nil,
+      heartbeat_timer: nil,
+      leader: nil,
+      role: :follower
     }
-
-    schedule_election_timeout(state)
+    state = schedule_election_timeout(state)
     {:ok, state}
   end
 
-  @impl true
-  def handle_call(:status, _from, state) do
-    {:reply, %{
-      state: state.state,
-      term: state.current_term,
-      leader: state.leader,
-      commit_index: state.commit_index,
-      membership: state.membership
-    }, state}
+  def get_state(server) do
+    GenServer.call(server, :get_state)
   end
 
-  @impl true
-  def handle_call(:membership, _from, state) do
-    {:reply, state.membership, state}
+  def get_term(server) do
+    GenServer.call(server, :get_term)
   end
 
-  @impl true
-  def handle_call(:get_entries, _from, state) do
-    entries = Log.get_entries(state.log)
-    {:reply, entries, state}
+  def append(server, entry) do
+    GenServer.call(server, {:append, entry})
   end
 
-  @impl true
-  def handle_call({:append, %{term: term, command: command}}, _from, state) do
-    if state.state != :leader do
-      {:reply, {:error, :not_leader}, state}
-    else
-      case Log.append(state.log, %{term: term, command: command}) do
-        :ok ->
-          # Increment commit index after append
-          entries = Log.get_entries(state.log)
-          new_commit_index = length(entries)
-          new_state = %{state | commit_index: new_commit_index}
-          replicate_log(new_state)
-          {:reply, :ok, new_state}
-        error ->
-          {:reply, error, state}
-      end
-    end
+  def read(server, key) do
+    GenServer.call(server, {:read, key})
   end
 
-  @impl true
-  def handle_call({:request_vote, %{term: term, candidate_id: candidate_id, last_log_index: last_log_index, last_log_term: last_log_term}}, _from, state) do
-    cond do
-      term < state.current_term ->
-        {:reply, {:error, :stale_term}, state}
-      term > state.current_term ->
-        new_state = %{state | current_term: term, voted_for: nil, state: :follower}
-        {:reply, {:error, :stale_term}, new_state}
-      state.voted_for != nil and state.voted_for != candidate_id ->
-        {:reply, {:error, :already_voted}, state}
-      true ->
-        # Grant vote if candidate's log is at least as up-to-date
-        entries = Log.get_entries(state.log)
-        last_entry = List.last(entries) || %{term: 0, index: 0}
-        
-        if last_log_term > last_entry.term or (last_log_term == last_entry.term and last_log_index >= last_entry.index) do
-          new_state = %{state | voted_for: candidate_id, state: :follower}
-          schedule_election_timeout(new_state)
-          {:reply, :ok, new_state}
-        else
-          {:reply, {:error, :log_not_up_to_date}, state}
-        end
-    end
+  def get_commit_index(server) do
+    GenServer.call(server, :get_commit_index)
   end
 
-  @impl true
-  def handle_call({:append_entries, entries}, _from, state) when is_list(entries) do
-    # For test: append entries directly
-    Log.append_many(state.log, entries, state.current_term)
-    {:reply, :ok, state}
-  end
-
-  @impl true
-  def handle_call({:append_entries, %{term: term, leader_id: leader_id, prev_log_index: prev_log_index, prev_log_term: prev_log_term, entries: entries, leader_commit: leader_commit}}, _from, state) do
-    cond do
-      term < state.current_term ->
-        {:reply, {:error, :stale_term}, state}
-      term > state.current_term ->
-        new_state = %{state | current_term: term, state: :follower, leader: leader_id}
-        handle_append_entries(new_state, prev_log_index, prev_log_term, entries, leader_commit)
-      true ->
-        handle_append_entries(state, prev_log_index, prev_log_term, entries, leader_commit)
-    end
+  def membership(server) do
+    GenServer.call(server, :membership)
   end
 
   @impl true
   def handle_info(:election_timeout, state) do
-    if state.state != :leader do
-      new_term = state.current_term + 1
+    if state.state == :follower do
       new_state = %{state |
         state: :candidate,
-        current_term: new_term,
-        voted_for: state.name,
-        leader: nil
+        current_term: state.current_term + 1,
+        voted_for: self()
       }
-      
-      # Request votes from all members
-      request_votes(new_state)
-      schedule_election_timeout(new_state)
       {:noreply, new_state}
     else
       {:noreply, state}
@@ -228,127 +114,323 @@ defmodule Eliraft.Server do
   end
 
   @impl true
-  def handle_info(:heartbeat, state) do
-    if state.state == :leader do
-      replicate_log(state)
-      schedule_heartbeat(state)
-    end
-    {:noreply, state}
+  def handle_call(:get_state, _from, state) do
+    {:reply, state.state, state}
   end
 
   @impl true
+  def handle_call(:get_term, _from, state) do
+    {:reply, state.current_term, state}
+  end
+
+  @impl true
+  def handle_call(:get_commit_index, _from, state) do
+    {:reply, state.commit_index, state}
+  end
+
+  @impl true
+  def handle_call(:membership, _from, state) do
+    {:reply, state.membership, state}
+  end
+
+  def handle_call({:append, %{term: term, command: command}}, _from, state) do
+    if state.state == :leader do
+      case Log.append(state.log, %{term: term, command: command}) do
+        :ok ->
+          new_state = %{state | commit_index: state.commit_index + 1}
+          replicate_to_followers(new_state)
+          {:reply, :ok, new_state}
+
+        error ->
+          {:reply, error, state}
+      end
+    else
+      {:reply, {:error, :not_leader}, state}
+    end
+  end
+
+  def handle_call({:read, key}, _from, state) do
+    if state.state == :leader do
+      case Log.get_entries(state.log, 0, state.commit_index) do
+        {:ok, entries} ->
+          value = find_value_in_entries(entries, key)
+          {:reply, {:ok, value}, state}
+
+        error ->
+          {:reply, error, state}
+      end
+    else
+      {:reply, {:error, :not_leader}, state}
+    end
+  end
+
+  def handle_call(
+        {:request_vote,
+         %{
+           term: term,
+           candidate_id: candidate_id,
+           last_log_index: last_log_index,
+           last_log_term: last_log_term
+         }},
+        _from,
+        state
+      ) do
+    cond do
+      term < state.current_term ->
+        {:reply, {:error, :stale_term}, state}
+
+      term > state.current_term ->
+        new_state = %{state | current_term: term, voted_for: nil, state: :follower}
+        schedule_election_timeout(new_state)
+        {:reply, {:error, :stale_term}, new_state}
+
+      state.voted_for != nil and state.voted_for != candidate_id ->
+        {:reply, {:error, :already_voted}, state}
+
+      true ->
+        case Log.get_entries(state.log, 0, last_log_index) do
+          {:ok, entries} ->
+            if is_log_consistent?(entries, last_log_term) do
+              new_state = %{state | voted_for: candidate_id}
+              schedule_election_timeout(new_state)
+              {:reply, :ok, new_state}
+            else
+              {:reply, {:error, :inconsistent_log}, state}
+            end
+
+          error ->
+            {:reply, error, state}
+        end
+    end
+  end
+
+  def handle_call({:append_entries, %{term: term, entries: entries, leader_commit: leader_commit}}, _from, state) do
+    cond do
+      term < state.current_term ->
+        {:reply, {:error, :stale_term}, state}
+      
+      true ->
+        case Log.append_many(state.log, entries) do
+          :ok ->
+            new_commit_index = min(leader_commit, state.commit_index + length(entries))
+            new_state = %{state | 
+              commit_index: new_commit_index,
+              current_term: term,
+              state: :follower
+            }
+            schedule_election_timeout(new_state)
+            {:reply, :ok, new_state}
+
+          error ->
+            {:reply, error, state}
+        end
+    end
+  end
+
+  def handle_call({:replicate_log, follower_log}, _from, state) do
+    case Log.get_entries(state.log, 0, state.commit_index) do
+      {:ok, entries} ->
+        case Log.append_many(follower_log, entries) do
+          :ok ->
+            {:reply, :ok, state}
+
+          error ->
+            {:reply, error, state}
+        end
+
+      error ->
+        {:reply, error, state}
+    end
+  end
+
   def handle_call({:set_state, new_state}, _from, state) do
     {:reply, :ok, %{state | state: new_state}}
   end
 
-  @impl true
-  def handle_call({:set_term, term}, _from, state) do
-    {:reply, :ok, %{state | current_term: term}}
+  def handle_call({:set_term, new_term}, _from, state) do
+    {:reply, :ok, %{state | current_term: new_term}}
   end
 
-  @impl true
+  def handle_vote(server, {:vote_granted, term}) do
+    GenServer.call(server, {:vote_granted, term})
+  end
+
+  def handle_call({:vote_granted, term}, _from, state) do
+    new_state =
+      if term >= state.current_term do
+        %{state | state: :leader, current_term: term}
+      else
+        state
+      end
+
+    {:reply, :ok, new_state}
+  end
+
+  def add_member(server, member) do
+    GenServer.call(server, {:add_member, member})
+  end
+
   def handle_call({:add_member, member}, _from, state) do
     new_membership = Map.put(state.membership, member, true)
     {:reply, :ok, %{state | membership: new_membership}}
   end
 
-  @impl true
+  def handle_vote_request(server, candidate, term) do
+    GenServer.call(server, {:handle_vote_request, candidate, term})
+  end
+
   def handle_call({:handle_vote_request, candidate, term}, _from, state) do
-    # For test: grant vote if term >= current_term
-    if term >= state.current_term do
-      {:reply, :ok, %{state | voted_for: candidate, current_term: term}}
-    else
-      {:reply, {:error, :stale_term}, state}
+    cond do
+      term < state.current_term ->
+        {:reply, {:error, :stale_term}, state}
+      term == state.current_term and state.voted_for != nil and state.voted_for != candidate ->
+        {:reply, {:error, :already_voted}, state}
+      true ->
+        new_state = %{state |
+          current_term: term,
+          voted_for: candidate,
+          state: :follower
+        }
+        {:reply, :ok, new_state}
     end
   end
 
-  @impl true
-  def handle_call({:replicate_log, follower_log}, _from, state) do
-    # For test: copy log entries from leader to follower's log process
-    entries = Log.get_entries(state.log)
-    Log.append_many(follower_log, entries, state.current_term)
-    {:reply, :ok, state}
+  def become_leader(server) do
+    GenServer.call(server, :become_leader)
   end
 
-  @impl true
-  def handle_call({:become_leader}, _from, state) do
+  def handle_call(:become_leader, _from, state) do
     {:reply, :ok, %{state | state: :leader}}
   end
 
-  # Private functions
+  def status(server) do
+    GenServer.call(server, :status)
+  end
+
+  @impl true
+  def handle_call(:status, _from, state) do
+    {:reply, %{
+      state: state.state,
+      term: state.current_term,
+      leader: state.voted_for,
+      membership: state.membership
+    }, state}
+  end
+
+  @impl true
+  def handle_call({:handle_append_entries, leader_id, term, prev_log_index, prev_log_term, entries, leader_commit}, _from, state) do
+    cond do
+      term < state.current_term ->
+        {:reply, {:error, :stale_term}, state}
+      prev_log_index > 0 and (prev_log_term != state.current_term or prev_log_index > state.commit_index) ->
+        {:reply, {:error, :log_inconsistency}, state}
+      true ->
+        new_state = %{state |
+          current_term: term,
+          state: :follower,
+          commit_index: min(leader_commit, state.commit_index + length(entries))
+        }
+        {:reply, :ok, new_state}
+    end
+  end
+
+  def handle_call(request, _from, state) do
+    Logger.warning("Unhandled call to Server: #{inspect(request)}")
+    {:reply, {:error, :unhandled_call}, state}
+  end
+
+  defp start_election(state) do
+    new_term = state.current_term + 1
+
+    new_state = %{
+      state
+      | state: :candidate,
+        current_term: new_term,
+        voted_for: state.name,
+        election_timer: nil
+    }
+
+    schedule_election_timeout(new_state)
+    new_state
+  end
 
   defp schedule_election_timeout(state) do
-    if state.election_timer do
-      Process.cancel_timer(state.election_timer)
-    end
     timeout = :rand.uniform(@election_timeout_max - @election_timeout_min) + @election_timeout_min
     timer = Process.send_after(self(), :election_timeout, timeout)
     %{state | election_timer: timer}
   end
 
   defp schedule_heartbeat(state) do
-    if state.heartbeat_timer do
-      Process.cancel_timer(state.heartbeat_timer)
-    end
     timer = Process.send_after(self(), :heartbeat, @heartbeat_interval)
     %{state | heartbeat_timer: timer}
   end
 
-  defp request_votes(state) do
-    # Request votes from all members
-    Enum.each(state.membership, fn {member, _} ->
-      if member != state.name and member != self() do
-        # Send vote request to member
-        # This is a simplified version for testing
-        GenServer.call(member, {:request_vote, %{
-          term: state.current_term,
-          candidate_id: state.name,
-          last_log_index: state.commit_index,
-          last_log_term: state.current_term
-        }})
-      end
-    end)
-  end
+  defp replicate_logs(state) do
+    for {follower, _} <- state.membership do
+      case Log.get_entries(state.log, 0, state.commit_index) do
+        {:ok, entries} ->
+          GenServer.cast(follower, {:append_entries, entries})
 
-  defp replicate_log(state) do
-    # Replicate log entries to all followers
-    Enum.each(state.membership, fn {member, _} ->
-      if member != state.name do
-        # Send append entries to member
-        # This is a simplified version for testing
-        GenServer.call(member, {:append_entries, %{
-          term: state.current_term,
-          leader_id: state.name,
-          prev_log_index: state.commit_index,
-          prev_log_term: state.current_term,
-          entries: Log.get_entries(state.log),
-          leader_commit: state.commit_index
-        }})
+        _ ->
+          :ok
       end
-    end)
-  end
-
-  defp handle_append_entries(state, prev_log_index, prev_log_term, entries, leader_commit) do
-    # Check if log is consistent
-    case Log.get_entry(state.log, prev_log_index) do
-      {:ok, entry} ->
-        if entry.term == prev_log_term do
-          # Log is consistent, append entries
-          case Log.append_many(state.log, entries, state.current_term) do
-            :ok ->
-              # Update commit index
-              new_commit_index = min(leader_commit, length(Log.get_entries(state.log)))
-              new_state = %{state | commit_index: new_commit_index}
-              schedule_election_timeout(new_state)
-              {:reply, :ok, new_state}
-            error ->
-              {:reply, error, state}
-          end
-        else
-          {:reply, {:error, :log_inconsistent}, state}
-        end
-      {:ok, nil} ->
-        {:reply, {:error, :log_inconsistent}, state}
     end
   end
-end 
+
+  defp is_log_consistent?(entries, last_log_term) do
+    case List.last(entries) do
+      nil -> true
+      entry -> entry.term == last_log_term
+    end
+  end
+
+  defp find_value_in_entries(entries, key) do
+    Enum.reduce(entries, nil, fn entry, acc ->
+      case entry.command do
+        {:set, ^key, value} -> value
+        _ -> acc
+      end
+    end)
+  end
+
+  def handle_call(:get, _from, state) do
+    {:reply, Eliraft.Storage.Disk.get(state.storage), state}
+  end
+
+  def handle_call({:put, key, value}, _from, state) do
+    new_storage = Eliraft.Storage.Disk.put(state.storage, key, value)
+    {:reply, :ok, %{state | storage: new_storage}}
+  end
+
+  def handle_call({:delete, key}, _from, state) do
+    new_storage = Eliraft.Storage.Disk.delete(state.storage, key)
+    {:reply, :ok, %{state | storage: new_storage}}
+  end
+
+  def handle_call(:clear, _from, state) do
+    new_storage = Eliraft.Storage.Disk.clear(state.storage)
+    {:reply, :ok, %{state | storage: new_storage}}
+  end
+
+  def set_state(server, new_state) do
+    GenServer.call(server, {:set_state, new_state})
+  end
+
+  def set_term(server, new_term) do
+    GenServer.call(server, {:set_term, new_term})
+  end
+
+  defp replicate_to_followers(state) do
+    case Log.get_entries(state.log, state.commit_index, :infinity) do
+      {:ok, entries} ->
+        Enum.each(state.membership, fn {follower, _} ->
+          GenServer.cast(follower, {:append_entries, %{
+            term: state.current_term,
+            entries: entries,
+            leader_commit: state.commit_index
+          }})
+        end)
+      _ -> :ok
+    end
+  end
+end

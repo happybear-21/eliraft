@@ -145,6 +145,18 @@ defmodule Eliraft.Queue do
     end
   end
 
+  @doc """
+  Returns a new default queue struct.
+  """
+  def new() do
+    %__MODULE__{
+      application: nil,
+      counters: nil,
+      commits: nil,
+      reads: nil
+    }
+  end
+
   # Server Callbacks
 
   @impl true

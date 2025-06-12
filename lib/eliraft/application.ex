@@ -10,6 +10,9 @@ defmodule Eliraft.Application do
 
   @impl true
   def start(_type, _args) do
+    # Create ETS table for server state
+    :ets.new(:eliraft_table, [:named_table, :public, :set])
+
     children = [
       # Starts a worker by calling: Eliraft.Worker.start_link(arg)
       # {Eliraft.Worker, arg}

@@ -17,7 +17,11 @@ defmodule Eliraft.Supervisor do
   Starts a new Raft server under the supervisor.
   """
   def start_server(args) do
-    DynamicSupervisor.start_child(__MODULE__, {Eliraft.Server, args})
+    case DynamicSupervisor.start_child(__MODULE__, {Eliraft.Server, args}) do
+      {:ok, pid} -> {:ok, pid}
+      {:error, {:already_started, pid}} -> {:ok, pid}
+      error -> error
+    end
   end
 
   @doc """
@@ -31,7 +35,8 @@ defmodule Eliraft.Supervisor do
   def init(_init_arg) do
     DynamicSupervisor.init(
       strategy: :one_for_one,
-      extra_arguments: []
+      max_restarts: 3,
+      max_seconds: 5
     )
   end
 end 

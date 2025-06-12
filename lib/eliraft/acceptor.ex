@@ -19,26 +19,27 @@ defmodule Eliraft.Acceptor do
   @type call_error :: {:error, call_error_type()}
   @type call_result :: term() | call_error()
 
-  @type read_error_type :: :not_leader | :read_queue_full | :apply_queue_full | {:notify_redirect, node()}
+  @type read_error_type ::
+          :not_leader | :read_queue_full | :apply_queue_full | {:notify_redirect, node()}
   @type read_error :: {:error, read_error_type()}
   @type read_result :: term() | read_error() | call_error()
 
   @type commit_error_type ::
-    :not_leader
-    | {:duplicate_request, key()}
-    | {:commit_queue_full, key()}
-    | {:apply_queue_full, key()}
-    | {:notify_redirect, node()}
-    | :commit_stalled
-    | :invalid_command
+          :not_leader
+          | {:duplicate_request, key()}
+          | {:commit_queue_full, key()}
+          | {:apply_queue_full, key()}
+          | {:notify_redirect, node()}
+          | :commit_stalled
+          | :invalid_command
   @type commit_error :: {:error, commit_error_type()}
   @type commit_result :: term() | commit_error() | call_error()
 
   # Server state
   defstruct [
-    :name,
     :server,
-    :queues
+    :storage,
+    :state
   ]
 
   # Public API
@@ -46,85 +47,162 @@ defmodule Eliraft.Acceptor do
   @doc """
   Starts a new acceptor server.
   """
-  def start_link(opts \\ []) do
-    GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name))
+  def start_link(opts) do
+    name = Keyword.get(opts, :name, __MODULE__)
+    GenServer.start_link(__MODULE__, opts, name: name)
   end
 
   @doc """
   Commits an operation to the Raft log with a default timeout.
   """
-  def commit(acceptor, op) do
-    commit(acceptor, op, 5000)
+  def commit(acceptor, command) do
+    GenServer.call(acceptor, {:commit, command})
   end
 
   @doc """
   Commits an operation with a custom timeout.
   """
-  def commit(acceptor, op, timeout) do
-    GenServer.call(acceptor, {:commit, op}, timeout)
+  def commit(acceptor, command, timeout) do
+    GenServer.call(acceptor, {:commit, command}, timeout)
   end
 
   @doc """
   Asynchronously commits an operation.
   """
-  def commit_async(acceptor, op, timeout) do
-    GenServer.cast(acceptor, {:commit, op, timeout})
+  def commit_async(acceptor, command, timeout) do
+    GenServer.cast(acceptor, {:commit, command, timeout})
   end
 
   @doc """
   Performs a strong read operation with a default timeout.
   """
-  def read(acceptor, op) do
-    read(acceptor, op, 5000)
+  def read(acceptor, key) do
+    GenServer.call(acceptor, {:read, key})
   end
 
   @doc """
   Performs a strong read operation with a custom timeout.
   """
-  def read(acceptor, op, timeout) do
-    GenServer.call(acceptor, {:read, op}, timeout)
+  def read(acceptor, key, timeout) do
+    GenServer.call(acceptor, {:read, key}, timeout)
+  end
+
+  def set_server(acceptor, server) do
+    GenServer.call(acceptor, {:set_server, server})
+  end
+
+  @doc """
+  Retrieves a value from the storage.
+  """
+  def get(acceptor) do
+    GenServer.call(acceptor, :get)
+  end
+
+  @doc """
+  Puts a value into the storage.
+  """
+  def put(acceptor, key, value) do
+    GenServer.call(acceptor, {:put, key, value})
+  end
+
+  @doc """
+  Deletes a value from the storage.
+  """
+  def delete(acceptor, key) do
+    GenServer.call(acceptor, {:delete, key})
+  end
+
+  @doc """
+  Clears the storage.
+  """
+  def clear(acceptor) do
+    GenServer.call(acceptor, :clear)
   end
 
   # Server Callbacks
 
   @impl true
   def init(opts) do
-    Logger.notice("Acceptor[#{opts[:name]}] starting")
-    Process.flag(:trap_exit, true)
-
     state = %__MODULE__{
-      name: opts[:name],
-      server: opts[:server],
-      queues: opts[:queues]
+      server: nil,
+      storage: Keyword.get(opts, :storage),
+      state: :follower
     }
-
     {:ok, state}
   end
 
   @impl true
-  def handle_call({:commit, op}, _from, state) do
-    # Check if the command is valid
-    if not is_valid_command?(op) do
-      {:reply, {:error, :invalid_command}, state}
-    else
-      # Forward the commit to the server
-      case GenServer.call(state.server, {:append, %{term: 1, command: op}}) do
-        :ok -> {:reply, :ok, state}
-        error -> {:reply, error, state}
-      end
+  def handle_call({:set_server, server}, _from, state) do
+    {:reply, :ok, %{state | server: server}}
+  end
+
+  @impl true
+  def handle_call({:commit, command}, _from, state) do
+    case Server.get_state(state.server) do
+      :leader ->
+        case is_valid_command?(command) do
+          true ->
+            case Server.append(state.server, %{term: Server.get_term(state.server), command: command}) do
+              :ok -> {:reply, :ok, state}
+              error -> {:reply, error, state}
+            end
+          false ->
+            {:reply, {:error, :invalid_command}, state}
+        end
+      _ ->
+        {:reply, {:error, :not_leader}, state}
     end
   end
 
   @impl true
-  def handle_call({:read, _op}, _from, state) do
-    # TODO: Implement read logic
-    {:reply, {:ok, nil}, state}
+  def handle_call({:read, key}, _from, state) do
+    case Eliraft.Storage.read(state.storage, key) do
+      {:ok, value} -> {:reply, {:ok, value}, state}
+      {:error, :not_found} -> {:reply, {:ok, nil}, state}
+      error -> {:reply, error, state}
+    end
   end
 
   @impl true
-  def handle_cast({:commit, _op, _timeout}, state) do
-    # TODO: Implement async commit logic
-    {:noreply, state}
+  def handle_call(:get, _from, state) do
+    {:reply, Eliraft.Storage.Disk.get(state.storage), state}
+  end
+
+  @impl true
+  def handle_call({:put, key, value}, _from, state) do
+    new_storage = Eliraft.Storage.Disk.put(state.storage, key, value)
+    {:reply, :ok, %{state | storage: new_storage}}
+  end
+
+  @impl true
+  def handle_call({:delete, key}, _from, state) do
+    new_storage = Eliraft.Storage.Disk.delete(state.storage, key)
+    {:reply, :ok, %{state | storage: new_storage}}
+  end
+
+  @impl true
+  def handle_call(:clear, _from, state) do
+    new_storage = Eliraft.Storage.Disk.clear(state.storage)
+    {:reply, :ok, %{state | storage: new_storage}}
+  end
+
+  @impl true
+  def handle_cast({:commit, command, timeout}, state) do
+    case Server.get_state(state.server) do
+      :leader ->
+        case Server.append(state.server, %{term: Server.get_term(state.server), command: command}) do
+          :ok -> {:noreply, state}
+          _ -> {:noreply, state}
+        end
+      _ ->
+        {:noreply, state}
+    end
+  end
+
+  @impl true
+  def handle_call(request, _from, state) do
+    Logger.warning("Unhandled call to Acceptor: #{inspect(request)}")
+    {:reply, {:error, :unhandled_call}, state}
   end
 
   # Private Functions
@@ -150,4 +228,4 @@ defmodule Eliraft.Acceptor do
     # TODO: Implement registered name lookup
     default_name(table, partition)
   end
-end 
+end
