@@ -12,7 +12,7 @@ Eliraft is an implementation of the Raft consensus algorithm in Elixir.
 ### 1. Clone the Repository
 
 ```sh
-git clone <your-repo-url>
+git clone https://github.com/happybear-21/eliraft.git
 cd eliraft
 ```
 
@@ -72,6 +72,15 @@ Eliraft.Acceptor.commit(acceptor, {:set, "key", "value"})
 Eliraft.Acceptor.read(acceptor, {:get, "key"})
 ```
 
+## Features
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Leader Election + Log Replication | ✅ Implemented | Basic leader election and log replication are implemented with tests. Includes term management, vote handling, and log consistency checks. |
+| Persistence | 🟡 Partial | Basic log persistence is implemented, but lacks disk-based persistence and crash recovery. |
+| Membership Changes | 🟡 Partial | Basic membership management is implemented in Config module, but lacks dynamic cluster reconfiguration. |
+| Log Compaction | ❌ Not Implemented | No implementation of log compaction or snapshot mechanism. |
+
 ## Development
 
 - To run tests:  
@@ -86,4 +95,3 @@ Eliraft.Acceptor.read(acceptor, {:get, "key"})
 ## License
 
 [Your License Here]
-
